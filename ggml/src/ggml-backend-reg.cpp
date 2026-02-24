@@ -82,6 +82,10 @@
 #include "ggml-zendnn.h"
 #endif
 
+#ifdef GGML_USE_FPGA
+#include "ggml-fpga.h"
+#endif
+
 namespace fs = std::filesystem;
 
 static std::string path_str(const fs::path & path) {
@@ -156,6 +160,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_CPU
         register_backend(ggml_backend_cpu_reg());
+#endif
+#ifdef GGML_USE_FPGA
+        register_backend(ggml_backend_fpga_reg());
 #endif
     }
 

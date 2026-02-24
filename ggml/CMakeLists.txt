@@ -228,6 +228,7 @@ option(GGML_WEBGPU_CPU_PROFILE              "ggml: enable WebGPU profiling (CPU)
 option(GGML_WEBGPU_GPU_PROFILE              "ggml: enable WebGPU profiling (GPU)"             OFF)
 option(GGML_WEBGPU_JSPI                     "ggml: use JSPI for WebGPU"                       ON)
 option(GGML_ZDNN                            "ggml: use zDNN"                                  OFF)
+option(GGML_FPGA                            "ggml: use FPGA GEMM backend (shared-memory stub)" OFF)
 option(GGML_VIRTGPU                         "ggml: use the VirtGPU/Virglrenderer API Remoting frontend"     OFF)
 option(GGML_VIRTGPU_BACKEND                 "ggml: build the VirtGPU/Virglrenderer API Remoting backend"    OFF)
 option(GGML_METAL                           "ggml: use Metal"                                 ${GGML_METAL_DEFAULT})
@@ -327,6 +328,7 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-vulkan.h
     include/ggml-webgpu.h
     include/ggml-zendnn.h
+    include/ggml-fpga.h
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")

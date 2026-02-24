@@ -72,6 +72,15 @@ if (MSVC)
     add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:/bigobj>")
 endif()
 
+# Use lld for faster linking when available (GCC/Clang on Linux etc.)
+if (NOT MSVC AND NOT APPLE AND NOT EMSCRIPTEN)
+    find_program(LLD_LINKER ld.lld)
+    if (LLD_LINKER)
+        add_link_options(-fuse-ld=lld)
+        message(STATUS "Using lld linker for faster builds")
+    endif()
+endif()
+
 if (LLAMA_STANDALONE)
     # enable parallel builds for msbuild
     list(APPEND CMAKE_VS_GLOBALS UseMultiToolTask=true)

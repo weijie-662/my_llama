@@ -138,3 +138,10 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# customized
+.clangd
+
+# Custom FPGA GEMM backend (PS + FPGA, DMA)
+ggml/src/ggml-fpga/
+inputs/
