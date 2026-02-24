@@ -1,5 +1,5 @@
 // FPGA GEMM backend (shared-memory + UIO stub).
-// Boilerplate only: replace shared-region and graph_compute MUL_MAT with real FPGA/DMA when ready.
+// Boilerplate only: replace shared-region and graph_compute FLASH_ATTN_EXT with real FPGA/DMA when ready.
 
 #include "ggml-impl.h"
 #include "ggml-fpga.h"
@@ -239,48 +239,32 @@ static bool ggml_fpga_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
 }
 
 // ---------------------------------------------------------------------------
-// Stub MUL_MAT (F32 only): C = A * B^T in row-major (replace with FPGA DMA+GEMM later)
+// Stub FLASH_ATTN_EXT: delegate to CPU (replace with FPGA when ready).
+// Uses same layout as ggml_compute_params so CPU impl can be called when linked.
 // ---------------------------------------------------------------------------
 
-static void ggml_fpga_mul_mat_f32_stub(ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
+struct ggml_fpga_compute_params {
+    int ith, nth;
+    size_t wsize;
+    void * wdata;
+    struct ggml_threadpool * threadpool;
+    bool use_ref;
+};
 
-    GGML_TENSOR_BINARY_OP_LOCALS
+extern "C" void ggml_compute_forward_flash_attn_ext(
+    const struct ggml_fpga_compute_params * params,
+    struct ggml_tensor * dst);
 
-    GGML_ASSERT(ne0 == ne01);
-    GGML_ASSERT(ne1 == ne11);
-    GGML_ASSERT(ne2 == ne12);
-    GGML_ASSERT(ne3 == ne13);
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(nb00 == sizeof(float));
-    GGML_ASSERT(nb10 == sizeof(float));
-    GGML_ASSERT(nb0 == sizeof(float) && nb0 <= nb1 && nb1 <= nb2 && nb2 <= nb3);
-
-    int64_t r2 = ne12 / ne02;
-    int64_t r3 = ne13 / ne03;
-
-    for (int64_t i13 = 0; i13 < ne13; i13++) {
-        for (int64_t i12 = 0; i12 < ne12; i12++) {
-            int64_t i03 = i13 / r3;
-            int64_t i02 = i12 / r2;
-            const float * x = reinterpret_cast<const float *>(static_cast<const char *>(src0->data) + i02 * nb02 + i03 * nb03);
-            const float * y = reinterpret_cast<const float *>(static_cast<const char *>(src1->data) + i12 * nb12 + i13 * nb13);
-            float * d       = reinterpret_cast<float *>(static_cast<char *>(dst->data) + i12 * nb2 + i13 * nb3);
-            // d = y * x^T  ->  d[i,j] = sum_k y[i,k] * x[j,k]
-            for (int64_t i = 0; i < ne1; i++) {
-                for (int64_t j = 0; j < ne01; j++) {
-                    float sum = 0;
-                    for (int64_t k = 0; k < ne10; k++) {
-                        sum += y[i * (nb11 / sizeof(float)) + k] * x[j * (nb01 / sizeof(float)) + k];
-                    }
-                    d[i * (nb1 / sizeof(float)) + j] = sum;
-                }
-            }
-        }
-    }
+static void ggml_fpga_flash_attn_ext_stub(ggml_tensor * node) {
+    static const struct ggml_fpga_compute_params params = {
+        /* .ith = */ 0,
+        /* .nth = */ 1,
+        /* .wsize = */ 0,
+        /* .wdata = */ nullptr,
+        /* .threadpool = */ nullptr,
+        /* .use_ref = */ false,
+    };
+    ggml_compute_forward_flash_attn_ext(&params, node);
 }
 
 // ---------------------------------------------------------------------------
@@ -319,12 +303,8 @@ static ggml_status ggml_backend_fpga_graph_compute(ggml_backend_t backend, ggml_
             node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
             continue;
         }
-        if (node->op == GGML_OP_MUL_MAT) {
-            if (node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32) {
-                ggml_fpga_mul_mat_f32_stub(node);
-            } else {
-                GGML_ASSERT(false && "FPGA backend stub: only F32 MUL_MAT supported");
-            }
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            ggml_fpga_flash_attn_ext_stub(node);
             continue;
         }
         GGML_ASSERT(false && "FPGA backend: unsupported op");
@@ -388,7 +368,7 @@ static const char * ggml_backend_fpga_device_get_name(ggml_backend_dev_t dev) {
 
 static const char * ggml_backend_fpga_device_get_description(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
-    return "FPGA GEMM (shared-memory stub)";
+    return "FPGA Flash Attention (shared-memory stub)";
 }
 
 static void ggml_backend_fpga_device_get_memory(ggml_backend_dev_t dev, size_t * free_bytes, size_t * total_bytes) {
@@ -422,11 +402,15 @@ static ggml_backend_buffer_type_t ggml_backend_fpga_device_get_buffer_type(ggml_
 
 static bool ggml_backend_fpga_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
-    if (op->op == GGML_OP_MUL_MAT) {
-        const ggml_tensor * src0 = op->src[0];
-        const ggml_tensor * src1 = op->src[1];
-        return src0 && src1 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
-               src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+    if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+        const ggml_tensor * q = op->src[0];
+        const ggml_tensor * k = op->src[1];
+        const ggml_tensor * v = op->src[2];
+        if (!q || !k || !v) {
+            return false;
+        }
+        return ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous(v) &&
+               op->type == GGML_TYPE_F32;
     }
     return false;
 }
