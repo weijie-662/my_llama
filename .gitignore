@@ -143,5 +143,4 @@ a.out.*
 .clangd
 
 # Custom FPGA GEMM backend (PS + FPGA, DMA)
-ggml/src/ggml-fpga/
 inputs/
