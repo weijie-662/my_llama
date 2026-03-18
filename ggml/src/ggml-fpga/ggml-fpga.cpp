@@ -6,86 +6,40 @@
 #include "ggml-backend-impl.h"
 #include "ggml.h"
 
+// Some ggml branches use GGML_OP_FLASH_ATTN, others use GGML_OP_FLASH_ATTN_EXT.
+// Treat GGML_OP_FLASH_ATTN as an alias for GGML_OP_FLASH_ATTN_EXT when it is not defined.
+#include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cerrno>
+#include <cmath>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/mman.h>
-
-#ifdef __linux__
-#include <sys/sysmacros.h>
-#endif
+#include <sys/stat.h>
 
 // ---------------------------------------------------------------------------
-// Shared region (stub: malloc when UIO not available; replace with UIO mmap later)
+// "Shared region" (test-only): plain CPU memory allocation
 // ---------------------------------------------------------------------------
 
 struct ggml_fpga_shared_region {
-    void *  base_virt;      // CPU virtual base
-    size_t size;            // size in bytes
     size_t alignment;       // allocation alignment (e.g. 4096 for DMA)
-    bool   use_uio;         // true if backed by UIO mmap, false if malloc stub
-    int    uio_fd;          // -1 or fd for /dev/uioX
-#ifdef __linux__
-    uintptr_t base_phys;    // physical base (for DMA; 0 in stub)
-#endif
 };
 
 static bool fpga_shared_region_init(struct ggml_fpga_shared_region * region) {
-    region->base_virt = nullptr;
-    region->size      = 0;
     region->alignment = 4096;
-    region->use_uio   = false;
-    region->uio_fd    = -1;
-#ifdef __linux__
-    region->base_phys = 0;
-#endif
-
-    // Stub: try /dev/uio0; if present you could mmap control + shared RAM here.
-    int fd = open("/dev/uio0", O_RDWR);
-    if (fd >= 0) {
-        close(fd);
-        // TODO: mmap UIO regions and set region->base_virt, region->size, region->base_phys from sysfs.
-    }
-
-    // Stub: no real shared region yet; alloc_buffer will use aligned_alloc per buffer.
-    // When UIO is wired, set region->base_virt/size here and use bump alloc in fpga_shared_region_alloc.
     return true;
 }
 
 static void fpga_shared_region_free(struct ggml_fpga_shared_region * region) {
-    if (region->base_virt && !region->use_uio) {
-        free(region->base_virt);
-    }
-    if (region->uio_fd >= 0) {
-        close(region->uio_fd);
-    }
-    region->base_virt = nullptr;
-    region->size      = 0;
-    region->uio_fd    = -1;
+    GGML_UNUSED(region);
 }
 
-// Allocate from the shared region. Stub: use aligned_alloc per buffer (replace with bump from region when using UIO).
 static void * fpga_shared_region_alloc(struct ggml_fpga_shared_region * region, size_t size, size_t * out_offset) {
     size_t aligned = (size + region->alignment - 1) & ~(region->alignment - 1);
     if (out_offset) {
         *out_offset = 0;
     }
-    if (region->base_virt && region->size > 0) {
-        // Real shared region: bump alloc (caller must reset between graphs if needed).
-        static size_t s_offset = 0;
-        if (s_offset + aligned > region->size) {
-            return nullptr;
-        }
-        size_t off = s_offset;
-        s_offset += aligned;
-        if (out_offset) {
-            *out_offset = off;
-        }
-        return static_cast<char *>(region->base_virt) + off;
-    }
-    // Stub: no region yet, allocate independently.
     void * p = nullptr;
 #if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
     if (posix_memalign(&p, region->alignment, aligned) != 0) {
@@ -97,19 +51,8 @@ static void * fpga_shared_region_alloc(struct ggml_fpga_shared_region * region, 
     return p;
 }
 
-// Physical address for DMA (stub: 0; with UIO read from sysfs maps/mapX/addr).
-static uintptr_t fpga_shared_region_virt_to_phys(struct ggml_fpga_shared_region const * region, void const * virt) {
-    GGML_UNUSED(region);
-    GGML_UNUSED(virt);
-#ifdef __linux__
-    return region->base_phys + (static_cast<char const *>(virt) - static_cast<char const *>(region->base_virt));
-#else
-    return 0;
-#endif
-}
-
 // ---------------------------------------------------------------------------
-// Buffer context (one buffer = one allocation from shared region)
+// Buffer context (one buffer = one allocation)
 // ---------------------------------------------------------------------------
 
 struct ggml_fpga_buffer_context {
@@ -121,15 +64,15 @@ struct ggml_fpga_buffer_context {
 
 static void ggml_fpga_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_fpga_buffer_context * ctx = static_cast<ggml_fpga_buffer_context *>(buffer->context);
-    if (ctx->owned && ctx->ptr && (!ctx->region || !ctx->region->base_virt)) {
-        free(ctx->ptr);  // Stub: we allocated with aligned_alloc.
+    if (ctx->owned && ctx->ptr) {
+        free(ctx->ptr);
     }
     delete ctx;
 }
 
 static void * ggml_fpga_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_fpga_buffer_context * ctx = static_cast<ggml_fpga_buffer_context *>(buffer->context);
-    return ctx->ptr;
+    return ctx->ptr; 
 }
 
 static ggml_status ggml_fpga_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
@@ -157,6 +100,37 @@ static void ggml_fpga_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml
     memcpy(data, base + tensor_off + offset, size);
 }
 
+static bool ggml_fpga_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    GGML_ASSERT(buffer);
+    GGML_ASSERT(src);
+    GGML_ASSERT(dst);
+
+    if (!ggml_are_same_layout(src, dst)) {
+        return false;
+    }
+
+    const size_t nbytes = ggml_nbytes(src);
+    if (nbytes == 0) {
+        return true;
+    }
+
+    // dst is in this buffer (FPGA buffer is host-accessible). Try fast paths first.
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        buffer->iface.set_tensor(buffer, dst, src->data, 0, nbytes);
+        return true;
+    }
+
+    // Fallback: pull via generic API then push into dst.
+    void * tmp = malloc(nbytes);
+    if (!tmp) {
+        return false;
+    }
+    ggml_backend_tensor_get(src, tmp, 0, nbytes);
+    buffer->iface.set_tensor(buffer, dst, tmp, 0, nbytes);
+    free(tmp);
+    return true;
+}
+
 static void ggml_fpga_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_fpga_buffer_context * ctx = static_cast<ggml_fpga_buffer_context *>(buffer->context);
     memset(ctx->ptr, value, ctx->size);
@@ -169,7 +143,7 @@ static struct ggml_backend_buffer_i const ggml_fpga_buffer_i = {
     /* .memset_tensor = */ ggml_fpga_buffer_memset_tensor,
     /* .set_tensor    = */ ggml_fpga_buffer_set_tensor,
     /* .get_tensor    = */ ggml_fpga_buffer_get_tensor,
-    /* .cpy_tensor    = */ nullptr,
+    /* .cpy_tensor    = */ ggml_fpga_buffer_cpy_tensor,
     /* .clear         = */ ggml_fpga_buffer_clear,
     /* .reset         = */ nullptr,
 };
@@ -239,8 +213,239 @@ static bool ggml_fpga_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
 }
 
 // ---------------------------------------------------------------------------
-// Stub FLASH_ATTN_EXT: delegate to CPU (replace with FPGA when ready).
-// Uses same layout as ggml_compute_params so CPU impl can be called when linked.
+// FPGA capture and stats (env: GGML_FPGA_CAPTURE=1, GGML_FPGA_LOG=1)
+// ---------------------------------------------------------------------------
+
+static int s_fpga_capture_index = 0;
+static int s_fpga_ops_total     = 0;
+static int s_fpga_log_written   = 0;  // 1 after first layout append
+static int s_fpga_dump_index    = 0;
+
+static int fpga_getenv_capture(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_FPGA_CAPTURE");
+        cached = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y')) ? 1 : 0;
+    }
+    return cached;
+}
+
+static int fpga_getenv_log(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char * v = getenv("GGML_FPGA_LOG");
+        cached = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y')) ? 1 : 0;
+    }
+    return cached;
+}
+
+static void ggml_fpga_ensure_outputs_dir(void) {
+    if (mkdir("outputs", 0755) != 0) {
+        if (errno != EEXIST) {
+            // Best-effort; ignore failures.
+        }
+    }
+}
+
+static void ggml_fpga_dump_tensor_to(const ggml_tensor * t, const char * path) {
+    if (!t || !t->data) {
+        return;
+    }
+    FILE * f = fopen(path, "wb");
+    if (!f) {
+        return;
+    }
+    fwrite(t->data, 1, ggml_nbytes(t), f);
+    fclose(f);
+}
+
+static void ggml_fpga_dump_tensor_hex_to(const ggml_tensor * t, const char * path) {
+    if (!t || !t->data) {
+        return;
+    }
+    FILE * f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+
+    const unsigned char * p = (const unsigned char *) t->data;
+    const size_t n = (size_t) ggml_nbytes(t);
+
+    fprintf(f, "type=%s nbytes=%zu ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] contiguous=%d\n",
+            ggml_type_name(t->type), n,
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            (size_t) t->nb[0], (size_t) t->nb[1], (size_t) t->nb[2], (size_t) t->nb[3],
+            ggml_is_contiguous(t) ? 1 : 0);
+
+    // If this is a float tensor with a standard element size, also decode values.
+    if (t->type == GGML_TYPE_F32) {
+        const int64_t nelem = ggml_nelements(t);
+        const size_t  step  = sizeof(float);
+        const size_t  max_e = n / step;
+        const size_t  n_e   = (size_t) (nelem < (int64_t) max_e ? nelem : (int64_t) max_e);
+
+        fputs("index  hex32       value\n", f);
+        for (size_t i = 0; i < n_e; ++i) {
+            uint32_t u32 = 0;
+            float    v   = 0.0f;
+            memcpy(&u32, p + i*step, sizeof(uint32_t));
+            memcpy(&v,   p + i*step, sizeof(float));
+            fprintf(f, "%8zu  %08x  %.4f\n", i, u32, v);
+        }
+
+        fclose(f);
+        return;
+    }
+
+    if (t->type == GGML_TYPE_F16) {
+        const int64_t nelem = ggml_nelements(t);
+        const size_t  step  = sizeof(ggml_fp16_t);
+        const size_t  max_e = n / step;
+        const size_t  n_e   = (size_t) (nelem < (int64_t) max_e ? nelem : (int64_t) max_e);
+
+        fputs("index  hex16  value\n", f);
+        for (size_t i = 0; i < n_e; ++i) {
+            ggml_fp16_t h = 0;
+            memcpy(&h, p + i*step, sizeof(ggml_fp16_t));
+            const float v = GGML_FP16_TO_FP32(h);
+            fprintf(f, "%8zu  %04x  %.4f\n", i, (unsigned) h, v);
+        }
+
+        fclose(f);
+        return;
+    }
+
+    // Fallback: simple hexdump: offset + 16 bytes per line.
+    for (size_t i = 0; i < n; i += 16) {
+        fprintf(f, "%08zx  ", i);
+        const size_t line = (n - i) < 16 ? (n - i) : 16;
+        for (size_t j = 0; j < 16; ++j) {
+            if (j < line) {
+                fprintf(f, "%02x ", p[i + j]);
+            } else {
+                fputs("   ", f);
+            }
+        }
+        fputs(" |", f);
+        for (size_t j = 0; j < line; ++j) {
+            const unsigned char c = p[i + j];
+            fputc((c >= 32 && c <= 126) ? (int) c : '.', f);
+        }
+        fputs("|\n", f);
+    }
+
+    fclose(f);
+}
+
+static void ggml_fpga_dump_tensor_bin_and_ascii(const ggml_tensor * t, const char * bin_path) {
+    ggml_fpga_dump_tensor_to(t, bin_path);
+
+    char txt_path[512];
+    snprintf(txt_path, sizeof(txt_path), "%s.txt", bin_path);
+    ggml_fpga_dump_tensor_hex_to(t, txt_path);
+}
+
+static void ggml_fpga_dump_flash_attn_tensors(ggml_tensor * node, int n, bool is_before) {
+    ggml_fpga_ensure_outputs_dir();
+
+    char path[256];
+    const ggml_tensor * q     = node->src[0];
+    const ggml_tensor * k     = node->src[1];
+    const ggml_tensor * v     = node->src[2];
+    const ggml_tensor * mask  = node->src[3];
+    const ggml_tensor * sinks = node->src[4];
+
+    const char * tag = is_before ? "before" : "after";
+
+    snprintf(path, sizeof(path), "outputs/fpga_flash_attn_%s_Q.bin", tag);
+    ggml_fpga_dump_tensor_bin_and_ascii(q, path);
+    snprintf(path, sizeof(path), "outputs/fpga_flash_attn_%s_K.bin", tag);
+    ggml_fpga_dump_tensor_bin_and_ascii(k, path);
+    snprintf(path, sizeof(path), "outputs/fpga_flash_attn_%s_V.bin", tag);
+    ggml_fpga_dump_tensor_bin_and_ascii(v, path);
+
+    if (mask) {
+        snprintf(path, sizeof(path), "outputs/fpga_flash_attn_%s_mask.bin", tag);
+        ggml_fpga_dump_tensor_bin_and_ascii(mask, path);
+    }
+
+    if (sinks) {
+        snprintf(path, sizeof(path), "outputs/fpga_flash_attn_%s_sinks.bin", tag);
+        ggml_fpga_dump_tensor_bin_and_ascii(sinks, path);
+    }
+
+    if (!is_before) {
+        snprintf(path, sizeof(path), "outputs/fpga_flash_attn_%s_dst.bin", tag);
+        ggml_fpga_dump_tensor_bin_and_ascii(node, path);
+    }
+}
+
+static void ggml_fpga_fprint_tensor_layout(FILE * f, const ggml_tensor * t, const char * label) {
+    if (!t) return;
+    fprintf(f, "%s: ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%s nbytes=%zu contiguous=%d\n",
+            label,
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            (size_t) t->nb[0], (size_t) t->nb[1], (size_t) t->nb[2], (size_t) t->nb[3],
+            ggml_type_name(t->type), (size_t) ggml_nbytes(t), ggml_is_contiguous(t) ? 1 : 0);
+}
+
+static void ggml_fpga_log_flash_attn_layout(FILE * f, const ggml_tensor * node) {
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * v = node->src[2];
+    const ggml_tensor * mask = node->src[3];
+    ggml_fpga_fprint_tensor_layout(f, q, "Q");
+    ggml_fpga_fprint_tensor_layout(f, k, "K");
+    ggml_fpga_fprint_tensor_layout(f, v, "V");
+    ggml_fpga_fprint_tensor_layout(f, node, "dst");
+    fprintf(f, "op_params[0..7]: %d %d %d %d %d %d %d %d\n",
+            ggml_get_op_params_i32(node, 0), ggml_get_op_params_i32(node, 1),
+            ggml_get_op_params_i32(node, 2), ggml_get_op_params_i32(node, 3),
+            ggml_get_op_params_i32(node, 4), ggml_get_op_params_i32(node, 5),
+            ggml_get_op_params_i32(node, 6), ggml_get_op_params_i32(node, 7));
+    if (mask) {
+        ggml_fpga_fprint_tensor_layout(f, mask, "mask");
+    }
+}
+
+static void ggml_fpga_print_stats_flash_attn(const ggml_tensor * node) {
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * v = node->src[2];
+}
+
+static void ggml_fpga_capture_flash_attn_inputs(ggml_tensor * node, int n) {
+    char path[256];
+    const ggml_tensor * q = node->src[0];
+    const ggml_tensor * k = node->src[1];
+    const ggml_tensor * v = node->src[2];
+    snprintf(path, sizeof(path), "fpga_capture_%d_Q.bin", n);
+    FILE * fq = fopen(path, "wb");
+    if (fq) { if (q->data) fwrite(q->data, 1, ggml_nbytes(q), fq); fclose(fq); }
+    snprintf(path, sizeof(path), "fpga_capture_%d_K.bin", n);
+    FILE * fk = fopen(path, "wb");
+    if (fk) { if (k->data) fwrite(k->data, 1, ggml_nbytes(k), fk); fclose(fk); }
+    snprintf(path, sizeof(path), "fpga_capture_%d_V.bin", n);
+    FILE * fv = fopen(path, "wb");
+    if (fv) { if (v->data) fwrite(v->data, 1, ggml_nbytes(v), fv); fclose(fv); }
+}
+
+static void ggml_fpga_capture_flash_attn_output(ggml_tensor * node, int n) {
+    char path[256];
+    snprintf(path, sizeof(path), "fpga_capture_%d_dst.bin", n);
+    FILE * fd = fopen(path, "wb");
+    if (fd) { if (node->data) fwrite(node->data, 1, ggml_nbytes(node), fd); fclose(fd); }
+    snprintf(path, sizeof(path), "fpga_capture_%d_meta.txt", n);
+    FILE * fm = fopen(path, "w");
+    if (fm) {
+        ggml_fpga_log_flash_attn_layout(fm, node);
+        fclose(fm);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test-only FLASH_ATTN_EXT reference implementation (C loops).
+// This is correctness-first and single-threaded; replace with FPGA kernel later.
 // ---------------------------------------------------------------------------
 
 struct ggml_fpga_compute_params {
@@ -251,9 +456,194 @@ struct ggml_fpga_compute_params {
     bool use_ref;
 };
 
-extern "C" void ggml_compute_forward_flash_attn_ext(
+static inline float ggml_fpga_load_f32(const ggml_tensor * t, const char * p) {
+    switch (t->type) {
+        case GGML_TYPE_F32: return *(const float *) p;
+        case GGML_TYPE_F16: return GGML_FP16_TO_FP32(*(const ggml_fp16_t *) p);
+        default: GGML_ABORT("ggml-fpga: unsupported type in flash_attn_ext ref");
+    }
+}
+
+static void ggml_fpga_compute_forward_flash_attn_ext_ref(
     const struct ggml_fpga_compute_params * params,
-    struct ggml_tensor * dst);
+    struct ggml_tensor * dst) {
+    GGML_UNUSED(params);
+
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_ASSERT(q && k && v);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_F16);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+    GGML_ASSERT(v->type == GGML_TYPE_F32 || v->type == GGML_TYPE_F16);
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
+    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
+    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+    const int64_t N  = neq1;
+
+    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne2 == N);
+
+    // input tensor rows must be contiguous
+    GGML_ASSERT(nbq0 == ggml_type_size(q->type));
+    GGML_ASSERT(nbk0 == ggml_type_size(k->type));
+    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
+
+    GGML_ASSERT(neq0 == DK);
+    GGML_ASSERT(nek0 == DK);
+    GGML_ASSERT(nev0 == DV);
+    GGML_ASSERT(neq1 == N);
+
+    // dst cannot be transposed or permuted
+    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb0 <= nb1);
+    GGML_ASSERT(nb1 <= nb2);
+    GGML_ASSERT(nb2 <= nb3);
+
+    // broadcast factors
+    const int64_t rk2 = neq2/nek2;
+    const int64_t rk3 = neq3/nek3;
+    const int64_t rv2 = neq2/nev2;
+    const int64_t rv3 = neq3/nev3;
+
+    float scale         = 1.0f;
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = (uint32_t) neq2;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2((double) n_head));
+    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
+    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    const int64_t nr = neq1 * neq2 * neq3; // total q rows
+
+    for (int64_t ir = 0; ir < nr; ++ir) {
+        const int iq3 = (int) (ir/(neq2*neq1));
+        const int iq2 = (int) ((ir - (int64_t) iq3*neq2*neq1)/neq1);
+        const int iq1 = (int) (ir - (int64_t) iq3*neq2*neq1 - (int64_t) iq2*neq1);
+
+        const uint32_t h = (uint32_t) iq2;
+        const float slope = (max_bias > 0.0f) ? (h < n_head_log2 ? powf(m0, (float) (h + 1)) : powf(m1, (float) (2*(h - n_head_log2) + 1))) : 1.0f;
+
+        float M = -INFINITY;
+        float S = 0.0f;
+
+        float * VKQ = (float *) alloca((size_t) DV * sizeof(float));
+        for (int64_t d = 0; d < DV; ++d) VKQ[d] = 0.0f;
+
+        const ggml_fp16_t * mp = nullptr;
+        if (mask) {
+            // matches CPU: mask indexed by (q_pos, head%mask_heads, batch%mask_batch)
+            mp = (const ggml_fp16_t *)((const char *) mask->data +
+                    (int64_t) iq1*mask->nb[1] +
+                    (int64_t) (iq2 % mask->ne[2])*mask->nb[2] +
+                    (int64_t) (iq3 % mask->ne[3])*mask->nb[3]);
+        }
+
+        const int ik3 = iq3 / (int) rk3;
+        const int ik2 = iq2 / (int) rk2;
+        const int iv3 = iq3 / (int) rv3;
+        const int iv2 = iq2 / (int) rv2;
+
+        const char * q_row = (const char *) q->data + (int64_t) iq1*nbq1 + (int64_t) iq2*nbq2 + (int64_t) iq3*nbq3;
+
+        // online softmax / attention over kv sequence (nek1)
+        for (int64_t ic = 0; ic < nek1; ++ic) {
+            const float mv = mp ? (slope * GGML_FP16_TO_FP32(mp[ic])) : 0.0f;
+            if (mv == -INFINITY) {
+                continue;
+            }
+
+            const char * k_row = (const char *) k->data + ic*nbk1 + (int64_t) ik2*nbk2 + (int64_t) ik3*nbk3;
+
+            float dot = 0.0f;
+            for (int64_t d = 0; d < DK; ++d) {
+                const char * qp = q_row + d*nbq0;
+                const char * kp = k_row + d*nbk0;
+                dot += ggml_fpga_load_f32(q, qp) * ggml_fpga_load_f32(k, kp);
+            }
+
+            float s = dot * scale;
+            if (logit_softcap != 0.0f) {
+                s = logit_softcap * tanhf(s);
+            }
+            s += mv;
+
+            const float Mold = M;
+            float ms = 1.0f;
+            float vs = 1.0f;
+
+            if (s > M) {
+                M = s;
+                ms = expf(Mold - M);
+                // VKQ *= ms
+                for (int64_t d = 0; d < DV; ++d) {
+                    VKQ[d] *= ms;
+                }
+            } else {
+                vs = expf(s - M);
+            }
+
+            // VKQ += V[ic] * vs
+            const char * v_row = (const char *) v->data + ic*nbv1 + (int64_t) iv2*nbv2 + (int64_t) iv3*nbv3;
+            for (int64_t d = 0; d < DV; ++d) {
+                const char * vp = v_row + d*nbv0;
+                VKQ[d] += ggml_fpga_load_f32(v, vp) * vs;
+            }
+
+            S = S*ms + vs;
+        }
+
+        // sinks (apply as if they were included in softmax, but without contributing to VKQ)
+        if (sinks) {
+            const float s_sink = ((const float *) sinks->data)[h];
+            float ms = 1.0f;
+            float vs = 1.0f;
+
+            if (s_sink > M) {
+                ms = expf(M - s_sink);
+                M = s_sink;
+                for (int64_t d = 0; d < DV; ++d) {
+                    VKQ[d] *= ms;
+                }
+            } else {
+                vs = expf(s_sink - M);
+            }
+
+            S = S*ms + vs;
+        }
+
+        const float invS = (S == 0.0f) ? 0.0f : (1.0f / S);
+        for (int64_t d = 0; d < DV; ++d) {
+            VKQ[d] *= invS;
+        }
+
+        // dst indices: permute(0, 2, 1, 3) in CPU impl
+        const int i1 = iq1;
+        const int i2 = iq2;
+        const int i3 = iq3;
+        memcpy((char *) dst->data + ((int64_t) i3*ne2*ne1 + i2 + (int64_t) i1*ne1)*nb1, VKQ, (size_t) nb1);
+    }
+}
 
 static void ggml_fpga_flash_attn_ext_stub(ggml_tensor * node) {
     static const struct ggml_fpga_compute_params params = {
@@ -264,7 +654,7 @@ static void ggml_fpga_flash_attn_ext_stub(ggml_tensor * node) {
         /* .threadpool = */ nullptr,
         /* .use_ref = */ false,
     };
-    ggml_compute_forward_flash_attn_ext(&params, node);
+    ggml_fpga_compute_forward_flash_attn_ext_ref(&params, node);
 }
 
 // ---------------------------------------------------------------------------
@@ -290,10 +680,39 @@ static void ggml_backend_fpga_free(ggml_backend_t backend) {
     delete backend;
 }
 
+static void ggml_backend_fpga_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    GGML_UNUSED(backend);
+    ggml_backend_tensor_set(tensor, data, offset, size);
+}
+
+static void ggml_backend_fpga_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    GGML_UNUSED(backend);
+    ggml_backend_tensor_get(tensor, data, offset, size);
+}
+
+static bool ggml_backend_fpga_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    GGML_UNUSED(backend_src);
+    GGML_UNUSED(backend_dst);
+
+    if (!ggml_are_same_layout(src, dst)) {
+        return false;
+    }
+
+    // Our buffer is host-accessible; fast path when src is host.
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
+        return true;
+    }
+
+    // Otherwise let the generic copy path handle it.
+    return false;
+}
+
 static ggml_status ggml_backend_fpga_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_fpga_context * ctx = static_cast<ggml_backend_fpga_context *>(backend->context);
     GGML_UNUSED(ctx);
 
+    int ops_this_graph = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
@@ -304,20 +723,38 @@ static ggml_status ggml_backend_fpga_graph_compute(ggml_backend_t backend, ggml_
             continue;
         }
         if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            ops_this_graph++;
+            ggml_fpga_print_stats_flash_attn(node);
+            if (fpga_getenv_log() && !s_fpga_log_written) {
+                FILE * fl = fopen("fpga_flash_attn_layout.txt", "a");
+                if (fl) {
+                    ggml_fpga_log_flash_attn_layout(fl, node);
+                    fclose(fl);
+                    s_fpga_log_written = 1;
+                }
+            }
+
+            const int dump_n = s_fpga_dump_index++;
+            ggml_fpga_dump_flash_attn_tensors(node, dump_n, /* is_before = */ true);
+
             ggml_fpga_flash_attn_ext_stub(node);
+
+            ggml_fpga_dump_flash_attn_tensors(node, dump_n, /* is_before = */ false);
+
             continue;
         }
         GGML_ASSERT(false && "FPGA backend: unsupported op");
     }
+    s_fpga_ops_total += ops_this_graph;
     return GGML_STATUS_SUCCESS;
 }
 
 static struct ggml_backend_i const ggml_backend_fpga_i = {
     /* .get_name           = */ ggml_backend_fpga_get_name,
     /* .free               = */ ggml_backend_fpga_free,
-    /* .set_tensor_async   = */ nullptr,
-    /* .get_tensor_async   = */ nullptr,
-    /* .cpy_tensor_async   = */ nullptr,
+    /* .set_tensor_async   = */ ggml_backend_fpga_set_tensor_async,
+    /* .get_tensor_async   = */ ggml_backend_fpga_get_tensor_async,
+    /* .cpy_tensor_async   = */ ggml_backend_fpga_cpy_tensor_async,
     /* .synchronize        = */ nullptr,
     /* .graph_plan_create  = */ nullptr,
     /* .graph_plan_free    = */ nullptr,
@@ -379,7 +816,7 @@ static void ggml_backend_fpga_device_get_memory(ggml_backend_dev_t dev, size_t *
 
 static enum ggml_backend_dev_type ggml_backend_fpga_device_get_type(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
-    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
+    return GGML_BACKEND_DEVICE_TYPE_GPU;
 }
 
 static void ggml_backend_fpga_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
@@ -406,17 +843,28 @@ static bool ggml_backend_fpga_device_supports_op(ggml_backend_dev_t dev, const g
         const ggml_tensor * q = op->src[0];
         const ggml_tensor * k = op->src[1];
         const ggml_tensor * v = op->src[2];
-        if (!q || !k || !v) {
-            return false;
-        }
-        return ggml_is_contiguous(q) && ggml_is_contiguous(k) && ggml_is_contiguous(v) &&
-               op->type == GGML_TYPE_F32;
+
+        if (!q || !k || !v) return false;
+
+        // 检查输入是否为 F32 或 F16 
+        auto is_supported_type = [](ggml_type type) {
+            return type == GGML_TYPE_F32 || type == GGML_TYPE_F16;
+        };
+
+        bool q_ok = is_supported_type(q->type);
+        bool k_ok = is_supported_type(k->type);
+        bool v_ok = is_supported_type(v->type);
+
+        // 如果你希望只要有 Q8_0 就能分发上来调试：
+        return q_ok && k_ok && v_ok;
     }
     return false;
 }
 
+// Accept own buffer type and host (CPU) buffers so the scheduler can assign FLASH_ATTN_EXT to FPGA
+// when Q/K/V live in CPU memory; the backend then reads from host (e.g. stub calls CPU compute).
 static bool ggml_backend_fpga_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return buft == ggml_backend_fpga_device_get_buffer_type(dev);
+    return buft == ggml_backend_fpga_device_get_buffer_type(dev) || ggml_backend_buft_is_host(buft);
 }
 
 static bool ggml_backend_fpga_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {

@@ -658,6 +658,46 @@ static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
 
+// statistics for the last graph passed to the backend scheduler
+static size_t g_ggml_last_graph_total_ops       = 0;
+static size_t g_ggml_last_graph_flash_attn_ops  = 0;
+
+static void ggml_backend_update_graph_stats(struct ggml_cgraph * graph) {
+    if (graph == NULL) {
+        g_ggml_last_graph_total_ops      = 0;
+        g_ggml_last_graph_flash_attn_ops = 0;
+        return;
+    }
+
+    size_t total_ops      = 0;
+    size_t flash_attn_ops = 0;
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node == NULL) {
+            continue;
+        }
+        if (ggml_is_view_op(node->op)) {
+            continue;
+        }
+
+        // only count computing ops (scheduler marks them with GGML_TENSOR_FLAG_COMPUTE)
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        ++total_ops;
+
+        if (node->op == GGML_OP_FLASH_ATTN_EXT ||
+            node->op == GGML_OP_FLASH_ATTN_BACK) {
+            ++flash_attn_ops;
+        }
+    }
+
+    g_ggml_last_graph_total_ops      = total_ops;
+    g_ggml_last_graph_flash_attn_ops = flash_attn_ops;
+}
+
 // scheduler
 
 #ifndef GGML_SCHED_MAX_BACKENDS
@@ -923,6 +963,14 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    // update statistics for this graph
+    ggml_backend_update_graph_stats(graph);
+
+    // print statistics to the terminal after ops have been assigned for this graph
+    fprintf(stderr, "[ggml] graph stats: total_ops = %zu, flash_attn_ops = %zu\n",
+            (size_t) g_ggml_last_graph_total_ops,
+            (size_t) g_ggml_last_graph_flash_attn_ops);
+
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -941,6 +989,27 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ABORT("%s: failed to initialize context\n", __func__);
     }
 
+#ifndef NDEBUG
+    for (int b = 0; b < sched->n_backends; ++b) {
+        ggml_backend_t backend = sched->backends[b];
+
+        // this calls the backend's .get_name (e.g. "CPU", "FPGA", "CUDA", etc.)
+        const char * name = backend->iface.get_name(backend);
+
+        fprintf(stderr, "[sched] backend_id=%d name=%s\n", b, name);
+    }
+#endif
+
+    // [weijie] force using fpga for flash attention
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        int * node_backend_id = &tensor_backend_id(node);
+        if (node->op == GGML_OP_FLASH_ATTN_EXT) {
+            *node_backend_id = 0;
+            node->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        }
+    }
+
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
@@ -957,7 +1026,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         // do not overwrite user assignments
         if (*node_backend_id == -1) {
             *node_backend_id = ggml_backend_sched_backend_id_from_cur(sched, node);
-
 #if 0
             // src
             if (node->op == GGML_OP_NONE) {
@@ -1097,7 +1165,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         } else {
             // assigned node: upgrade to higher prio backend if possible
             for (int b = 0; b < *node_backend_id; b++) {
-                if (sched->bufts[b] == sched->bufts[*node_backend_id] && ggml_backend_supports_op(sched->backends[b], node)) {
+                if (!ggml_backend_supports_op(sched->backends[b], node)) {
+                    continue;
+                }
+                bool same_buft = (sched->bufts[b] == sched->bufts[*node_backend_id]);
+                bool offload_ok = ggml_backend_offload_op(sched->backends[b], node);
+                if (!same_buft && !offload_ok) {
+                    continue;
+                }
+                if (same_buft || offload_ok) {
                     bool supported = true;
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
                         struct ggml_tensor * src = node->src[j];
@@ -1111,7 +1187,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                     if (supported) {
                         *node_backend_id = b;
-                        SET_CAUSE(node, "3.upg");
+                        SET_CAUSE(node, same_buft ? "3.upg" : "3.off");
                         break;
                     }
                 }
@@ -1877,6 +1953,14 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
         return NULL;
     }
     return sched->backends[backend_index];
+}
+
+size_t ggml_backend_get_last_graph_total_ops(void) {
+    return g_ggml_last_graph_total_ops;
+}
+
+size_t ggml_backend_get_last_graph_flash_attn_ops(void) {
+    return g_ggml_last_graph_flash_attn_ops;
 }
 
 // utils

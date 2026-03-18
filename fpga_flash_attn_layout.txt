@@ -1,0 +1,24 @@
+Q: ne=[64,2,15,1] nb=[4,3840,256,7680] type=f32 nbytes=7680 contiguous=0
+K: ne=[64,256,5,1] nb=[2,640,128,5242880] type=f16 nbytes=163840 contiguous=0
+V: ne=[64,256,5,1] nb=[2,640,128,5242880] type=f16 nbytes=163840 contiguous=0
+dst: ne=[64,15,2,1] nb=[4,256,3840,7680] type=f32 nbytes=7680 contiguous=1
+op_params[0..7]: 1040187392 0 0 10 0 0 0 0
+mask: ne=[256,2,1,1] nb=[2,512,1024,1024] type=f16 nbytes=1024 contiguous=1
+Q: ne=[64,2,15,1] nb=[4,3840,256,7680] type=f32 nbytes=7680 contiguous=0
+K: ne=[64,256,5,1] nb=[2,640,128,5242880] type=f16 nbytes=163840 contiguous=0
+V: ne=[64,256,5,1] nb=[2,640,128,5242880] type=f16 nbytes=163840 contiguous=0
+dst: ne=[64,15,2,1] nb=[4,256,3840,7680] type=f32 nbytes=7680 contiguous=1
+op_params[0..7]: 1040187392 0 0 10 0 0 0 0
+mask: ne=[256,2,1,1] nb=[2,512,1024,1024] type=f16 nbytes=1024 contiguous=1
+Q: ne=[64,2,15,1] nb=[4,3840,256,7680] type=f32 nbytes=7680 contiguous=0
+K: ne=[64,256,5,1] nb=[2,640,128,5242880] type=f16 nbytes=163840 contiguous=0
+V: ne=[64,256,5,1] nb=[2,640,128,5242880] type=f16 nbytes=163840 contiguous=0
+dst: ne=[64,15,2,1] nb=[4,256,3840,7680] type=f32 nbytes=7680 contiguous=1
+op_params[0..7]: 1040187392 0 0 10 0 0 0 0
+mask: ne=[256,2,1,1] nb=[2,512,1024,1024] type=f16 nbytes=1024 contiguous=1
+Q: ne=[64,2,15,1] nb=[4,3840,256,7680] type=f32 nbytes=7680 contiguous=0
+K: ne=[64,256,5,1] nb=[2,640,128,5242880] type=f16 nbytes=163840 contiguous=0
+V: ne=[64,256,5,1] nb=[2,640,128,5242880] type=f16 nbytes=163840 contiguous=0
+dst: ne=[64,15,2,1] nb=[4,256,3840,7680] type=f32 nbytes=7680 contiguous=1
+op_params[0..7]: 1040187392 0 0 10 0 0 0 0
+mask: ne=[256,2,1,1] nb=[2,512,1024,1024] type=f16 nbytes=1024 contiguous=1

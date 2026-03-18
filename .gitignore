@@ -144,3 +144,4 @@ a.out.*
 
 # Custom FPGA GEMM backend (PS + FPGA, DMA)
 inputs/
+outputs/

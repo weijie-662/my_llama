@@ -6,6 +6,7 @@
 #include "common.h"
 #include "llama.h"
 #include "log.h"
+#include "ggml-backend.h"
 
 #include <atomic>
 #include <exception>

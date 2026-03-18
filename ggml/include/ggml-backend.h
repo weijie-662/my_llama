@@ -368,6 +368,14 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    //
+    // Graph statistics
+    //
+    // Statistics are collected for the last graph passed to the backend scheduler.
+    // Currently only the total number of ops and the number of flash attention ops are tracked.
+    GGML_API size_t ggml_backend_get_last_graph_total_ops(void);
+    GGML_API size_t ggml_backend_get_last_graph_flash_attn_ops(void);
+
 #ifdef  __cplusplus
 }
 #endif

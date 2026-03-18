@@ -1,0 +1,9 @@
+---
+alwaysApply: true
+---
+
+We are trying to use FPGA to accelerate the GGML_OP_FLASH_ATTN_EXT and GGML_OP_FLASH_ATTN op. Here's some steps to do before we proceed: 
+    - Create placeholders for the ggml-fpga.cpp memory alloc part and the real flash_attn compute stub. This is to pass the compilation at this moment. 
+    - We will inspect the ops that gets lowered to the ggml_backend_fpga_graph_compute function. Please keep track of the operator data type, operator shape, and the detailed algo of the operators. 
+    - During runtime I will be feeding some test data to the prompt, that's when you need to capture these data. 
+    - All the builds are debug build and goes to the build-fpga-debug folder. Enable only cpu and fpga backend. 

@@ -1680,20 +1680,6 @@ static void ggml_compute_forward_mul_mat_id(
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
-    // [weijie] print the flash_attn op info
-    if (tensor->op == GGML_OP_FLASH_ATTN_EXT) {
-        // FLASH_ATTN_EXT 通常有 3-4 个输入
-        struct ggml_tensor * q = tensor->src[0];
-        struct ggml_tensor * k = tensor->src[1];
-        struct ggml_tensor * v = tensor->src[2];
-        struct ggml_tensor * mask = (tensor->src[3] ? tensor->src[3] : NULL);
-
-        fprintf(stderr, "[FPGA-Info] Flash_Attn: Q(%ld,%ld,%ld,%ld) K(%ld,%ld,%ld,%ld) V(%ld,%ld,%ld,%ld)\n",
-                q->ne[0], q->ne[1], q->ne[2], q->ne[3],
-                k->ne[0], k->ne[1], k->ne[2], k->ne[3],
-                v->ne[0], v->ne[1], v->ne[2], v->ne[3]);
-    }
-
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
         return;
     }
