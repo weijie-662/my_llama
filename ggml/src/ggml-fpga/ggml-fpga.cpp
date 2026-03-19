@@ -18,6 +18,132 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+/* new implementation */
+#include <xrt/xrt_device.h>
+#include <xrt/xrt_bo.h>
+#include <vector>
+#include <memory>
+
+struct fpga_shared_region {
+    xrt::device device;
+    
+    // Four dedicated BOs for Flash Attention
+    struct {
+        xrt::bo bo;
+        void*   virt_addr;
+        size_t  phys_addr;
+        size_t  size;
+    } q, k, v, o;
+
+    bool initialized = false;
+};
+
+static std::unique_ptr<fpga_shared_region> g_fpga_reg = nullptr;
+
+bool fpga_shared_region_init(size_t q_sz, size_t k_sz, size_t v_sz, size_t o_sz, int device_index = 0) {
+    try {
+        g_fpga_reg = std::make_unique<fpga_shared_region>();
+        g_fpga_reg->device = xrt::device(device_index);
+
+        auto alloc_bo = [&](auto& node, size_t size, const std::string& name) {
+            node.size = (size + 4095) & ~4095; // Align to 4K
+            node.bo = xrt::bo(g_fpga_reg->device, node.size, xrt::bo::flags::normal, 0);
+            node.virt_addr = node.bo.map<void*>();
+            node.phys_addr = node.bo.address();
+            std::cout << "[FPGA] Allocated " << name << " at Phys: 0x" << std::hex << node.phys_addr << std::dec << std::endl;
+        };
+
+        alloc_bo(g_fpga_reg->q, q_sz, "Query");
+        alloc_bo(g_fpga_reg->k, k_sz, "Key");
+        alloc_bo(g_fpga_reg->v, v_sz, "Value");
+        alloc_bo(g_fpga_reg->o, o_sz, "Output");
+
+        g_fpga_reg->initialized = true;
+        return true;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "FPGA Shared Region Init Error: %s\n", e.what());
+        return false;
+    }
+}
+
+enum fpga_buffer_type { Q_BUF, K_BUF, V_BUF, O_BUF };
+
+void* fpga_shared_region_alloc(fpga_buffer_type type, size_t* out_phys_addr) {
+    if (!g_fpga_reg || !g_fpga_reg->initialized) return nullptr;
+
+    switch (type) {
+        case Q_BUF: *out_phys_addr = g_fpga_reg->q.phys_addr; return g_fpga_reg->q.virt_addr;
+        case K_BUF: *out_phys_addr = g_fpga_reg->k.phys_addr; return g_fpga_reg->k.virt_addr;
+        case V_BUF: *out_phys_addr = g_fpga_reg->v.phys_addr; return g_fpga_reg->v.virt_addr;
+        case O_BUF: *out_phys_addr = g_fpga_reg->o.phys_addr; return g_fpga_reg->o.virt_addr;
+        default: return nullptr;
+    }
+}
+
+void fpga_shared_region_free() {
+    g_fpga_reg.reset(); // Automatically calls destructors for BOs and Device
+}
+
+// Buffer-level context
+struct ggml_fpga_buffer_context {
+    void *  virt_base;    // Virtual address for CPU access (mapped)
+    uint64_t phys_base;   // Physical address for FPGA DMA
+    size_t   size;
+};
+
+// Tensor-level metadata stored in tensor->extra
+struct ggml_fpga_tensor_extra {
+    uint64_t phys_addr;   // Exact physical address for this tensor
+};
+
+enum ggml_status ggml_fpga_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    auto * buf_ctx = (ggml_fpga_buffer_context *)buffer->context;
+
+    // 1. Create extra metadata for this tensor
+    auto * extra = new ggml_fpga_tensor_extra;
+    
+    // 2. Calculate physical address: Base + Offset
+    // tensor->off is the offset within the buffer assigned by ggml-alloc
+    extra->phys_addr = buf_ctx->phys_base + tensor->off;
+    
+    // 3. Attach to tensor
+    tensor->extra = extra;
+
+    // 4. Update the virtual pointer for CPU-side ops (e.g., loading weights)
+    tensor->data = (char *)buf_ctx->virt_base + tensor->off;
+
+    return GGML_STATUS_SUCCESS;
+}
+
+void ggml_fpga_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    auto * buf_ctx = (ggml_fpga_buffer_context *)buffer->context;
+    
+    // Note: Individual tensor->extra cleanup usually happens 
+    // when the graph is destroyed or during buffer reset.
+    
+    delete buf_ctx;
+}
+
+ggml_backend_buffer_t ggml_backend_fpga_buffer_alloc(size_t size) {
+    auto * buf_ctx = new ggml_fpga_buffer_context();
+    
+    // Use the allocator we built in the previous step
+    buf_ctx->virt_base = fpga_shared_region_alloc(size);
+    
+    // Retrieve the physical address from our global XRT context
+    size_t offset = (uint8_t *)buf_ctx->virt_base - (uint8_t *)g_ctx->ptr;
+    buf_ctx->phys_base = g_ctx->root_bo.address() + offset; 
+    buf_ctx->size = size;
+
+    return ggml_backend_buffer_init(
+        /* buft  */ ggml_backend_fpga_buffer_type(),
+        /* iface */ ggml_backend_fpga_buffer_interface,
+        /* ctx   */ buf_ctx,
+        /* size  */ size
+    );
+}
+
+// The following is the obsolete original version. 
 // ---------------------------------------------------------------------------
 // "Shared region" (test-only): plain CPU memory allocation
 // ---------------------------------------------------------------------------
